@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  carrier-testing-framework:
+    build: .
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - WS_PORT=3001
+      - DB_TYPE=sqlite
+      - DB_PATH=/app/data/database.sqlite
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/data/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Optional: PostgreSQL database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=carrier_testing
+      - POSTGRES_USER=carrier_user
+      - POSTGRES_PASSWORD=secure_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    profiles: ["postgres"]
+
+  # Optional: Redis for caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    profiles: ["redis"]
+
+volumes:
+  postgres_data:
+
+networks:
+  default:
+    name: carrier-testing-network
