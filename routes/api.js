@@ -4,184 +4,130 @@ const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 
 // Import services
+const TestingEngine = require('../services/testing-engine');
 const DatabaseService = require('../services/database');
 const Logger = require('../services/logger');
 
 const logger = new Logger();
+const testingEngine = new TestingEngine();
 const dbService = new DatabaseService();
 
-// API Connection Test
-router.post('/connection', async (req, res) => {
-    try {
-        const { endpoint, authType, credentials, timeout = 10000 } = req.body;
-
-        if (!endpoint || !credentials) {
-            return res.status(400).json({
-                error: 'Endpoint and credentials are required'
-            });
-        }
-
-        logger.info('Testing API connection', { endpoint, authType });
-
-        const startTime = Date.now();
-        let headers = {};
-
-        // Set up authentication
-        switch (authType) {
-            case 'bearer':
-                headers['Authorization'] = `Bearer ${credentials}`;
-                break;
-            case 'apikey':
-                headers['X-API-Key'] = credentials;
-                break;
-            case 'basic':
-                headers['Authorization'] = `Basic ${Buffer.from(credentials).toString('base64')}`;
-                break;
-        }
-
-        try {
-            const response = await axios.get(endpoint, {
-                headers,
-                timeout
-            });
-
-            const responseTime = Date.now() - startTime;
-
-            res.json({
-                success: true,
-                statusCode: response.status,
-                responseTime,
-                message: 'Connection successful'
-            });
-
-        } catch (error) {
-            const responseTime = Date.now() - startTime;
-            
-            res.json({
-                success: false,
-                statusCode: error.response?.status || 0,
-                responseTime,
-                message: error.message,
-                error: error.response?.data || 'Connection failed'
-            });
-        }
-
-    } catch (error) {
-        logger.error('API connection test error:', error);
-        res.status(500).json({
-            error: 'Failed to test API connection',
-            message: error.message
-        });
-    }
-});
-
 // API Endpoint Testing
-router.post('/endpoint-test', async (req, res) => {
+router.post('/test', async (req, res) => {
     try {
         const { 
             endpoints, 
-            authConfig, 
-            concurrentRequests = 1,
-            testDuration = 60 
+            method = 'GET', 
+            headers = {}, 
+            payload = null, 
+            timeout = 30000,
+            iterations = 1,
+            interval = 1000
         } = req.body;
-
-        if (!endpoints || !Array.isArray(endpoints) || endpoints.length === 0) {
-            return res.status(400).json({
-                error: 'Endpoints array is required'
-            });
-        }
 
         const testId = uuidv4();
 
-        logger.info(`Starting API endpoint testing ${testId}`, { 
+        if (!endpoints || !Array.isArray(endpoints) || endpoints.length === 0) {
+            return res.status(400).json({
+                error: 'At least one endpoint is required'
+            });
+        }
+
+        logger.info(`Starting API test ${testId}`, { 
             endpointCount: endpoints.length, 
-            concurrentRequests 
+            method, 
+            iterations 
         });
 
         const testConfig = {
             testId,
-            type: 'api-endpoint',
+            type: 'api_test',
             endpoints,
-            authConfig,
-            concurrentRequests,
-            testDuration,
+            method,
+            headers,
+            payload,
+            timeout,
+            iterations,
+            interval,
             startTime: new Date()
         };
 
         await dbService.saveTestConfig(testConfig);
-        
-        // Run API endpoint tests
-        runEndpointTests(testId, endpoints, authConfig, concurrentRequests, testDuration);
+
+        // Run API test
+        runApiTest(testId, testConfig);
 
         res.json({
             testId,
             status: 'started',
-            endpoints: endpoints.length,
-            estimatedCompletion: new Date(Date.now() + testDuration * 1000)
+            endpointCount: endpoints.length,
+            estimatedDuration: Math.ceil((iterations * endpoints.length * interval) / 1000)
         });
 
     } catch (error) {
-        logger.error('API endpoint testing error:', error);
+        logger.error('API test error:', error);
         res.status(500).json({
-            error: 'Failed to start API endpoint testing',
+            error: 'Failed to start API test',
             message: error.message
         });
     }
 });
 
 // Load Testing
-router.post('/load-test', async (req, res) => {
+router.post('/load', async (req, res) => {
     try {
-        const { 
+        const {
             endpoint,
-            pattern = 'constant',
-            virtualUsers = 10,
+            method = 'GET',
+            headers = {},
+            payload = null,
+            concurrency = 10,
             duration = 60,
-            authConfig
+            rampUp = 10
         } = req.body;
-
-        if (!endpoint) {
-            return res.status(400).json({
-                error: 'Endpoint is required'
-            });
-        }
 
         const testId = uuidv4();
 
+        if (!endpoint) {
+            return res.status(400).json({
+                error: 'Endpoint is required for load testing'
+            });
+        }
+
         logger.info(`Starting load test ${testId}`, { 
             endpoint, 
-            pattern, 
-            virtualUsers, 
+            concurrency, 
             duration 
         });
 
         const testConfig = {
             testId,
-            type: 'load-test',
+            type: 'load_test',
             endpoint,
-            pattern,
-            virtualUsers,
+            method,
+            headers,
+            payload,
+            concurrency,
             duration,
-            authConfig,
+            rampUp,
             startTime: new Date()
         };
 
         await dbService.saveTestConfig(testConfig);
-        
+
         // Run load test
-        runLoadTest(testId, endpoint, pattern, virtualUsers, duration, authConfig);
+        runLoadTest(testId, testConfig);
 
         res.json({
             testId,
             status: 'started',
-            pattern,
-            virtualUsers,
-            duration,
-            estimatedCompletion: new Date(Date.now() + duration * 1000)
+            endpoint,
+            concurrency,
+            estimatedCompletion: new Date(Date.now() + (duration + rampUp) * 1000)
         });
 
     } catch (error) {
-        logger.error('Load testing error:', error);
+        logger.error('Load test error:', error);
         res.status(500).json({
             error: 'Failed to start load test',
             message: error.message
@@ -189,54 +135,110 @@ router.post('/load-test', async (req, res) => {
     }
 });
 
-// Performance Testing
-router.post('/performance-test', async (req, res) => {
+// Carrier API Integration Test
+router.post('/carrier', async (req, res) => {
     try {
-        const { 
-            scenarios,
-            duration = 300,
-            rampUpTime = 60
+        const {
+            carrierId,
+            testSuite = 'basic',
+            authConfig = {}
         } = req.body;
-
-        if (!scenarios || !Array.isArray(scenarios) || scenarios.length === 0) {
-            return res.status(400).json({
-                error: 'Test scenarios are required'
-            });
-        }
 
         const testId = uuidv4();
 
-        logger.info(`Starting performance test ${testId}`, { 
-            scenarioCount: scenarios.length, 
+        if (!carrierId) {
+            return res.status(400).json({
+                error: 'Carrier ID is required'
+            });
+        }
+
+        // Get carrier configuration
+        const carriers = await dbService.getCarriers();
+        const carrier = carriers.find(c => c.id === carrierId);
+
+        if (!carrier) {
+            return res.status(404).json({
+                error: 'Carrier not found'
+            });
+        }
+
+        logger.info(`Starting carrier API test ${testId}`, { carrierId, testSuite });
+
+        const testConfig = {
+            testId,
+            type: 'carrier_api_test',
+            carrierId,
+            carrier,
+            testSuite,
+            authConfig,
+            startTime: new Date()
+        };
+
+        await dbService.saveTestConfig(testConfig);
+
+        // Run carrier API test
+        runCarrierApiTest(testId, testConfig);
+
+        res.json({
+            testId,
+            status: 'started',
+            carrier: carrier.name,
+            testSuite
+        });
+
+    } catch (error) {
+        logger.error('Carrier API test error:', error);
+        res.status(500).json({
+            error: 'Failed to start carrier API test',
+            message: error.message
+        });
+    }
+});
+
+// API Health Check
+router.post('/health', async (req, res) => {
+    try {
+        const { endpoints, interval = 30, duration = 300 } = req.body;
+        const testId = uuidv4();
+
+        if (!endpoints || !Array.isArray(endpoints)) {
+            return res.status(400).json({
+                error: 'Endpoints array is required'
+            });
+        }
+
+        logger.info(`Starting API health check ${testId}`, { 
+            endpointCount: endpoints.length, 
+            interval, 
             duration 
         });
 
         const testConfig = {
             testId,
-            type: 'performance-test',
-            scenarios,
+            type: 'api_health_check',
+            endpoints,
+            interval,
             duration,
-            rampUpTime,
             startTime: new Date()
         };
 
         await dbService.saveTestConfig(testConfig);
-        
-        // Run performance test
-        runPerformanceTest(testId, scenarios, duration, rampUpTime);
+
+        // Run health check
+        runApiHealthCheck(testId, testConfig);
 
         res.json({
             testId,
             status: 'started',
-            scenarios: scenarios.length,
-            duration,
-            estimatedCompletion: new Date(Date.now() + (duration + rampUpTime) * 1000)
+            endpoints: endpoints.length,
+            checkInterval: interval,
+            estimatedCompletion: new Date(Date.now() + duration * 1000)
         });
 
     } catch (error) {
-        logger.error('Performance testing error:', error);
+        logger.error('API health check error:', error);
         res.status(500).json({
-            error: 'Failed to start performance test',
+            error: 'Failed to start API health check',
             message: error.message
         });
     }
@@ -247,7 +249,7 @@ router.get('/results/:testId', async (req, res) => {
     try {
         const { testId } = req.params;
         const results = await dbService.getApiTestResults(testId);
-
+        
         if (results.length === 0) {
             return res.status(404).json({
                 error: 'No results found for this test'
@@ -255,218 +257,190 @@ router.get('/results/:testId', async (req, res) => {
         }
 
         // Calculate summary statistics
-        const summary = {
-            totalRequests: results.length,
-            successfulRequests: results.filter(r => r.success).length,
-            failedRequests: results.filter(r => !r.success).length,
-            averageResponseTime: results.reduce((acc, r) => acc + r.response_time, 0) / results.length,
-            minResponseTime: Math.min(...results.map(r => r.response_time)),
-            maxResponseTime: Math.max(...results.map(r => r.response_time))
-        };
+        const summary = calculateApiTestSummary(results);
 
         res.json({
             testId,
             summary,
-            results: results.slice(0, 100) // Limit to last 100 results
+            results: results.slice(0, 100) // Limit to latest 100 results
         });
 
     } catch (error) {
         logger.error('Get API test results error:', error);
         res.status(500).json({
-            error: 'Failed to get test results',
+            error: 'Failed to get API test results',
             message: error.message
         });
     }
 });
 
-// Implementation functions
-async function runEndpointTests(testId, endpoints, authConfig, concurrentRequests, testDuration) {
+// Implementation Functions
+
+async function runApiTest(testId, config) {
     try {
-        const startTime = Date.now();
-        const endTime = startTime + (testDuration * 1000);
-        
-        const runTest = async (endpoint) => {
-            while (Date.now() < endTime) {
-                const requestStart = Date.now();
-                
+        const { endpoints, method, headers, payload, timeout, iterations, interval } = config;
+        let completedRequests = 0;
+        const totalRequests = endpoints.length * iterations;
+
+        for (let iteration = 0; iteration < iterations; iteration++) {
+            for (const endpoint of endpoints) {
                 try {
-                    let headers = {};
+                    const startTime = Date.now();
                     
-                    // Set up authentication
-                    if (authConfig) {
-                        switch (authConfig.type) {
-                            case 'bearer':
-                                headers['Authorization'] = `Bearer ${authConfig.token}`;
-                                break;
-                            case 'apikey':
-                                headers['X-API-Key'] = authConfig.key;
-                                break;
-                        }
+                    const axiosConfig = {
+                        method: method.toLowerCase(),
+                        url: endpoint,
+                        headers,
+                        timeout,
+                        validateStatus: () => true // Don't throw on HTTP error status
+                    };
+
+                    if (payload && (method.toUpperCase() === 'POST' || method.toUpperCase() === 'PUT')) {
+                        axiosConfig.data = payload;
                     }
 
-                    const response = await axios({
-                        method: endpoint.method || 'GET',
-                        url: endpoint.url,
-                        headers,
-                        timeout: 10000
-                    });
+                    const response = await axios(axiosConfig);
+                    const responseTime = Date.now() - startTime;
 
-                    const responseTime = Date.now() - requestStart;
-                    
                     const result = {
                         testId,
-                        endpoint: endpoint.url,
-                        method: endpoint.method || 'GET',
+                        endpoint,
+                        method,
                         statusCode: response.status,
                         responseTime,
-                        success: response.status >= 200 && response.status < 300,
-                        errorMessage: null
+                        success: response.status >= 200 && response.status < 400,
+                        responseSize: JSON.stringify(response.data).length,
+                        headers: response.headers,
+                        timestamp: new Date()
                     };
 
                     await dbService.saveApiTestResult(result);
+                    completedRequests++;
+
+                    // Broadcast real-time update
+                    const { broadcast } = require('../server');
+                    if (broadcast) {
+                        broadcast({
+                            type: 'api_test_update',
+                            testId,
+                            data: result,
+                            progress: (completedRequests / totalRequests) * 100
+                        });
+                    }
 
                 } catch (error) {
-                    const responseTime = Date.now() - requestStart;
-                    
                     const result = {
                         testId,
-                        endpoint: endpoint.url,
-                        method: endpoint.method || 'GET',
-                        statusCode: error.response?.status || 0,
-                        responseTime,
+                        endpoint,
+                        method,
+                        statusCode: 0,
+                        responseTime: timeout,
                         success: false,
-                        errorMessage: error.message
+                        errorMessage: error.message,
+                        timestamp: new Date()
                     };
 
                     await dbService.saveApiTestResult(result);
+                    completedRequests++;
+
+                    logger.error(`API test error for ${endpoint}:`, error.message);
                 }
 
-                // Wait before next request
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                // Wait between requests
+                if (interval > 0 && completedRequests < totalRequests) {
+                    await new Promise(resolve => setTimeout(resolve, interval));
+                }
             }
-        };
-
-        // Run tests for all endpoints concurrently
-        const promises = endpoints.map(endpoint => runTest(endpoint));
-        await Promise.all(promises);
+        }
 
         await dbService.updateTestStatus(testId, 'completed');
-        logger.info(`API endpoint testing ${testId} completed`);
+        
+        const { broadcast } = require('../server');
+        if (broadcast) {
+            broadcast({
+                type: 'api_test_complete',
+                testId,
+                completedRequests,
+                totalRequests
+            });
+        }
+
+        logger.info(`API test ${testId} completed: ${completedRequests}/${totalRequests} requests`);
 
     } catch (error) {
-        logger.error(`API endpoint testing ${testId} error:`, error);
+        logger.error(`API test ${testId} error:`, error);
         await dbService.updateTestStatus(testId, 'failed');
     }
 }
 
-async function runLoadTest(testId, endpoint, pattern, virtualUsers, duration, authConfig) {
+async function runLoadTest(testId, config) {
     try {
+        const { endpoint, method, headers, payload, concurrency, duration, rampUp } = config;
+        const workers = [];
+        const results = [];
         const startTime = Date.now();
         const endTime = startTime + (duration * 1000);
         
-        // Calculate load pattern
-        let currentUsers = pattern === 'ramp' ? 1 : virtualUsers;
-        const userIncrement = pattern === 'ramp' ? Math.floor(virtualUsers / 10) : 0;
+        // Ramp up workers gradually
+        const rampUpInterval = (rampUp * 1000) / concurrency;
         
-        const activeUsers = new Set();
-        
-        const createUser = async (userId) => {
-            while (Date.now() < endTime && activeUsers.has(userId)) {
-                const requestStart = Date.now();
+        for (let i = 0; i < concurrency; i++) {
+            setTimeout(() => {
+                const worker = createLoadTestWorker(testId, endpoint, method, headers, payload, endTime, results);
+                workers.push(worker);
+            }, i * rampUpInterval);
+        }
+
+        // Monitor and report progress
+        const reportInterval = setInterval(async () => {
+            if (Date.now() >= endTime) {
+                clearInterval(reportInterval);
                 
-                try {
-                    let headers = {};
-                    
-                    if (authConfig) {
-                        switch (authConfig.type) {
-                            case 'bearer':
-                                headers['Authorization'] = `Bearer ${authConfig.token}`;
-                                break;
-                            case 'apikey':
-                                headers['X-API-Key'] = authConfig.key;
-                                break;
-                        }
-                    }
+                // Calculate final statistics
+                const summary = {
+                    totalRequests: results.length,
+                    successfulRequests: results.filter(r => r.success).length,
+                    failedRequests: results.filter(r => !r.success).length,
+                    averageResponseTime: results.reduce((sum, r) => sum + r.responseTime, 0) / results.length,
+                    minResponseTime: Math.min(...results.map(r => r.responseTime)),
+                    maxResponseTime: Math.max(...results.map(r => r.responseTime)),
+                    requestsPerSecond: results.length / duration,
+                    duration: duration
+                };
 
-                    const response = await axios.get(endpoint, {
-                        headers,
-                        timeout: 10000
-                    });
+                await dbService.saveTestResult(testId, summary);
+                await dbService.updateTestStatus(testId, 'completed');
 
-                    const responseTime = Date.now() - requestStart;
-                    
-                    const result = {
+                const { broadcast } = require('../server');
+                if (broadcast) {
+                    broadcast({
+                        type: 'load_test_complete',
                         testId,
-                        endpoint,
-                        method: 'GET',
-                        statusCode: response.status,
-                        responseTime,
-                        success: response.status >= 200 && response.status < 300,
-                        errorMessage: null
-                    };
+                        summary
+                    });
+                }
 
-                    await dbService.saveApiTestResult(result);
-
-                    // Broadcast real-time update
-                    const { broadcast } = require('../server');
+                logger.info(`Load test ${testId} completed: ${summary.totalRequests} requests, ${summary.requestsPerSecond.toFixed(2)} RPS`);
+            } else {
+                // Report current progress
+                const currentRPS = results.length / ((Date.now() - startTime) / 1000);
+                const { broadcast } = require('../server');
+                if (broadcast) {
                     broadcast({
                         type: 'load_test_update',
                         testId,
                         data: {
-                            activeUsers: activeUsers.size,
-                            responseTime,
-                            success: result.success
+                            totalRequests: results.length,
+                            currentRPS: currentRPS.toFixed(2),
+                            activeWorkers: workers.length,
+                            elapsed: Math.floor((Date.now() - startTime) / 1000)
                         }
                     });
-
-                } catch (error) {
-                    const responseTime = Date.now() - requestStart;
-                    
-                    const result = {
-                        testId,
-                        endpoint,
-                        method: 'GET',
-                        statusCode: error.response?.status || 0,
-                        responseTime,
-                        success: false,
-                        errorMessage: error.message
-                    };
-
-                    await dbService.saveApiTestResult(result);
                 }
-
-                // Random delay between requests (0.5-2 seconds)
-                await new Promise(resolve => setTimeout(resolve, Math.random() * 1500 + 500));
             }
-        };
+        }, 5000); // Report every 5 seconds
 
-        // Start initial users
-        for (let i = 0; i < currentUsers; i++) {
-            activeUsers.add(i);
-            createUser(i);
-        }
-
-        // Ramp up users if pattern is 'ramp'
-        if (pattern === 'ramp') {
-            const rampInterval = setInterval(() => {
-                if (currentUsers < virtualUsers && Date.now() < endTime) {
-                    for (let i = 0; i < userIncrement && currentUsers < virtualUsers; i++) {
-                        const userId = currentUsers++;
-                        activeUsers.add(userId);
-                        createUser(userId);
-                    }
-                } else {
-                    clearInterval(rampInterval);
-                }
-            }, (duration * 1000) / 10); // Ramp up over 10 intervals
-        }
-
-        // Wait for test to complete
-        setTimeout(async () => {
-            activeUsers.clear();
-            await dbService.updateTestStatus(testId, 'completed');
-            logger.info(`Load test ${testId} completed`);
-        }, duration * 1000);
+        testingEngine.addActiveTest(testId, reportInterval);
 
     } catch (error) {
         logger.error(`Load test ${testId} error:`, error);
@@ -474,43 +448,272 @@ async function runLoadTest(testId, endpoint, pattern, virtualUsers, duration, au
     }
 }
 
-async function runPerformanceTest(testId, scenarios, duration, rampUpTime) {
+function createLoadTestWorker(testId, endpoint, method, headers, payload, endTime, results) {
+    const worker = setInterval(async () => {
+        if (Date.now() >= endTime) {
+            clearInterval(worker);
+            return;
+        }
+
+        try {
+            const startTime = Date.now();
+            
+            const axiosConfig = {
+                method: method.toLowerCase(),
+                url: endpoint,
+                headers,
+                timeout: 30000,
+                validateStatus: () => true
+            };
+
+            if (payload && (method.toUpperCase() === 'POST' || method.toUpperCase() === 'PUT')) {
+                axiosConfig.data = payload;
+            }
+
+            const response = await axios(axiosConfig);
+            const responseTime = Date.now() - startTime;
+
+            const result = {
+                testId,
+                endpoint,
+                method,
+                statusCode: response.status,
+                responseTime,
+                success: response.status >= 200 && response.status < 400,
+                timestamp: new Date()
+            };
+
+            results.push(result);
+            await dbService.saveApiTestResult(result);
+
+        } catch (error) {
+            const result = {
+                testId,
+                endpoint,
+                method,
+                statusCode: 0,
+                responseTime: 30000,
+                success: false,
+                errorMessage: error.message,
+                timestamp: new Date()
+            };
+
+            results.push(result);
+            await dbService.saveApiTestResult(result);
+        }
+    }, Math.random() * 1000 + 500); // Random interval between 500-1500ms
+
+    return worker;
+}
+
+async function runCarrierApiTest(testId, config) {
     try {
-        // Simulate comprehensive performance testing
-        const startTime = Date.now();
-        const totalDuration = (duration + rampUpTime) * 1000;
-        
-        for (const scenario of scenarios) {
-            // Run each scenario
-            setTimeout(async () => {
+        const { carrier, testSuite, authConfig } = config;
+        const testSuites = {
+            basic: [
+                { endpoint: '/status', method: 'GET', description: 'Service status check' },
+                { endpoint: '/health', method: 'GET', description: 'Health check' }
+            ],
+            comprehensive: [
+                { endpoint: '/status', method: 'GET', description: 'Service status check' },
+                { endpoint: '/health', method: 'GET', description: 'Health check' },
+                { endpoint: '/coverage', method: 'GET', description: 'Coverage areas' },
+                { endpoint: '/plans', method: 'GET', description: 'Available plans' },
+                { endpoint: '/usage', method: 'GET', description: 'Usage statistics' }
+            ],
+            authentication: [
+                { endpoint: '/auth/token', method: 'POST', description: 'Token authentication' },
+                { endpoint: '/auth/validate', method: 'GET', description: 'Token validation' },
+                { endpoint: '/auth/refresh', method: 'POST', description: 'Token refresh' }
+            ]
+        };
+
+        const tests = testSuites[testSuite] || testSuites.basic;
+        const baseURL = carrier.api_endpoint || carrier.apiEndpoint;
+
+        if (!baseURL) {
+            throw new Error('Carrier API endpoint not configured');
+        }
+
+        for (const test of tests) {
+            try {
+                const fullEndpoint = `${baseURL}${test.endpoint}`;
+                const startTime = Date.now();
+
+                const axiosConfig = {
+                    method: test.method.toLowerCase(),
+                    url: fullEndpoint,
+                    timeout: 30000,
+                    validateStatus: () => true
+                };
+
+                // Add authentication if configured
+                if (authConfig.apiKey) {
+                    axiosConfig.headers = {
+                        'Authorization': `Bearer ${authConfig.apiKey}`,
+                        'Content-Type': 'application/json'
+                    };
+                }
+
+                if (test.method.toUpperCase() === 'POST' && test.payload) {
+                    axiosConfig.data = test.payload;
+                }
+
+                const response = await axios(axiosConfig);
+                const responseTime = Date.now() - startTime;
+
                 const result = {
-                    scenario: scenario.name,
-                    throughput: Math.random() * 1000 + 100, // Requests per second
-                    averageResponseTime: Math.random() * 500 + 100, // ms
-                    errorRate: Math.random() * 5, // Percentage
+                    testId,
+                    endpoint: fullEndpoint,
+                    method: test.method,
+                    description: test.description,
+                    statusCode: response.status,
+                    responseTime,
+                    success: response.status >= 200 && response.status < 400,
+                    responseData: response.data,
                     timestamp: new Date()
                 };
 
-                await dbService.saveTestResult(testId, result);
-                
+                await dbService.saveApiTestResult(result);
+
+                // Broadcast update
                 const { broadcast } = require('../server');
-                broadcast({
-                    type: 'performance_test_update',
+                if (broadcast) {
+                    broadcast({
+                        type: 'carrier_api_update',
+                        testId,
+                        data: result
+                    });
+                }
+
+                logger.info(`Carrier API test: ${test.description} - ${result.success ? 'PASSED' : 'FAILED'}`);
+
+            } catch (error) {
+                const result = {
                     testId,
-                    data: result
-                });
-            }, Math.random() * totalDuration);
+                    endpoint: `${baseURL}${test.endpoint}`,
+                    method: test.method,
+                    description: test.description,
+                    statusCode: 0,
+                    responseTime: 30000,
+                    success: false,
+                    errorMessage: error.message,
+                    timestamp: new Date()
+                };
+
+                await dbService.saveApiTestResult(result);
+                logger.error(`Carrier API test error for ${test.description}:`, error.message);
+            }
+
+            // Small delay between tests
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
 
-        setTimeout(async () => {
-            await dbService.updateTestStatus(testId, 'completed');
-            logger.info(`Performance test ${testId} completed`);
-        }, totalDuration);
+        await dbService.updateTestStatus(testId, 'completed');
+        logger.info(`Carrier API test ${testId} completed for ${carrier.name}`);
 
     } catch (error) {
-        logger.error(`Performance test ${testId} error:`, error);
+        logger.error(`Carrier API test ${testId} error:`, error);
         await dbService.updateTestStatus(testId, 'failed');
     }
+}
+
+async function runApiHealthCheck(testId, config) {
+    try {
+        const { endpoints, interval, duration } = config;
+        const startTime = Date.now();
+        const endTime = startTime + (duration * 1000);
+
+        const intervalId = setInterval(async () => {
+            const timestamp = new Date();
+            
+            for (const endpoint of endpoints) {
+                try {
+                    const checkStartTime = Date.now();
+                    const response = await axios.get(endpoint, {
+                        timeout: 10000,
+                        validateStatus: () => true
+                    });
+                    const responseTime = Date.now() - checkStartTime;
+
+                    const result = {
+                        testId,
+                        endpoint,
+                        method: 'GET',
+                        statusCode: response.status,
+                        responseTime,
+                        success: response.status >= 200 && response.status < 400,
+                        timestamp
+                    };
+
+                    await dbService.saveApiTestResult(result);
+
+                    // Broadcast health status
+                    const { broadcast } = require('../server');
+                    if (broadcast) {
+                        broadcast({
+                            type: 'api_health_update',
+                            testId,
+                            endpoint,
+                            data: result
+                        });
+                    }
+
+                } catch (error) {
+                    const result = {
+                        testId,
+                        endpoint,
+                        method: 'GET',
+                        statusCode: 0,
+                        responseTime: 10000,
+                        success: false,
+                        errorMessage: error.message,
+                        timestamp
+                    };
+
+                    await dbService.saveApiTestResult(result);
+                }
+            }
+
+            if (Date.now() >= endTime) {
+                clearInterval(intervalId);
+                await dbService.updateTestStatus(testId, 'completed');
+                logger.info(`API health check ${testId} completed`);
+            }
+        }, interval * 1000);
+
+        testingEngine.addActiveTest(testId, intervalId);
+
+    } catch (error) {
+        logger.error(`API health check ${testId} error:`, error);
+        await dbService.updateTestStatus(testId, 'failed');
+    }
+}
+
+function calculateApiTestSummary(results) {
+    if (results.length === 0) return {};
+
+    const successful = results.filter(r => r.success);
+    const failed = results.filter(r => !r.success);
+
+    return {
+        totalRequests: results.length,
+        successfulRequests: successful.length,
+        failedRequests: failed.length,
+        successRate: (successful.length / results.length) * 100,
+        averageResponseTime: results.reduce((sum, r) => sum + r.response_time, 0) / results.length,
+        minResponseTime: Math.min(...results.map(r => r.response_time)),
+        maxResponseTime: Math.max(...results.map(r => r.response_time)),
+        statusCodeDistribution: results.reduce((acc, r) => {
+            acc[r.status_code] = (acc[r.status_code] || 0) + 1;
+            return acc;
+        }, {}),
+        errorTypes: failed.reduce((acc, r) => {
+            const error = r.error_message || 'Unknown error';
+            acc[error] = (acc[error] || 0) + 1;
+            return acc;
+        }, {})
+    };
 }
 
 module.exports = router;

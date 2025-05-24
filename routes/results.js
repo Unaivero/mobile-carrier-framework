@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const fs = require('fs');
+const fs = require('fs').promises;
 const path = require('path');
 
 // Import services
@@ -10,36 +10,95 @@ const Logger = require('../services/logger');
 const logger = new Logger();
 const dbService = new DatabaseService();
 
-// Get Test Results Summary
-router.get('/summary', async (req, res) => {
+// Get all test results with pagination
+router.get('/', async (req, res) => {
     try {
         const { 
-            startDate, 
-            endDate, 
-            testType, 
-            limit = 100 
+            page = 1, 
+            limit = 50, 
+            type = null, 
+            status = null,
+            startDate = null,
+            endDate = null 
         } = req.query;
 
-        const statistics = await dbService.getTestStatistics();
-        const recentTests = await dbService.getRecentTests(limit);
+        const offset = (page - 1) * limit;
+        
+        let sql = `SELECT * FROM test_configs WHERE 1=1`;
+        const params = [];
+
+        if (type) {
+            sql += ` AND type = ?`;
+            params.push(type);
+        }
+
+        if (status) {
+            sql += ` AND status = ?`;
+            params.push(status);
+        }
+
+        if (startDate) {
+            sql += ` AND created_at >= ?`;
+            params.push(startDate);
+        }
+
+        if (endDate) {
+            sql += ` AND created_at <= ?`;
+            params.push(endDate);
+        }
+
+        sql += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+        params.push(parseInt(limit), offset);
+
+        const tests = await dbService.db.all(sql, params);
+        
+        // Get total count
+        let countSql = `SELECT COUNT(*) as total FROM test_configs WHERE 1=1`;
+        const countParams = [];
+        
+        if (type) {
+            countSql += ` AND type = ?`;
+            countParams.push(type);
+        }
+        if (status) {
+            countSql += ` AND status = ?`;
+            countParams.push(status);
+        }
+        if (startDate) {
+            countSql += ` AND created_at >= ?`;
+            countParams.push(startDate);
+        }
+        if (endDate) {
+            countSql += ` AND created_at <= ?`;
+            countParams.push(endDate);
+        }
+
+        const countResult = await dbService.db.get(countSql, countParams);
 
         res.json({
-            statistics,
-            recentTests,
-            timestamp: new Date().toISOString()
+            tests: tests.map(test => ({
+                ...test,
+                config: JSON.parse(test.config)
+            })),
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: countResult.total,
+                pages: Math.ceil(countResult.total / limit)
+            }
         });
 
     } catch (error) {
-        logger.error('Get results summary error:', error);
+        logger.error('Get test results error:', error);
         res.status(500).json({
-            error: 'Failed to get results summary',
+            error: 'Failed to get test results',
             message: error.message
         });
     }
 });
 
-// Get Detailed Test Results
-router.get('/test/:testId', async (req, res) => {
+// Get specific test results
+router.get('/:testId', async (req, res) => {
     try {
         const { testId } = req.params;
         const { limit = 100 } = req.query;
@@ -51,17 +110,17 @@ router.get('/test/:testId', async (req, res) => {
             });
         }
 
-        const testResults = await dbService.getTestResults(testId, limit);
+        const results = await dbService.getTestResults(testId, limit);
 
         res.json({
             testId,
             config: testConfig,
-            results: testResults,
-            totalResults: testResults.length
+            results,
+            resultCount: results.length
         });
 
     } catch (error) {
-        logger.error('Get detailed test results error:', error);
+        logger.error('Get specific test results error:', error);
         res.status(500).json({
             error: 'Failed to get test results',
             message: error.message
@@ -69,46 +128,76 @@ router.get('/test/:testId', async (req, res) => {
     }
 });
 
-// Export Test Results
-router.post('/export', async (req, res) => {
+// Export test results
+router.post('/export/:testId', async (req, res) => {
     try {
-        const { 
-            format = 'json',
-            testIds = [],
-            startDate,
-            endDate,
-            includeConfig = true
-        } = req.body;
+        const { testId } = req.params;
+        const { format = 'json', includeConfig = true } = req.body;
 
-        const supportedFormats = ['json', 'csv', 'xml', 'pdf', 'html'];
-        if (!supportedFormats.includes(format)) {
-            return res.status(400).json({
-                error: 'Unsupported export format',
-                supportedFormats
+        const testConfig = await dbService.getTestStatus(testId);
+        if (!testConfig) {
+            return res.status(404).json({
+                error: 'Test not found'
             });
         }
 
-        logger.info('Exporting test results', { format, testIds: testIds.length });
+        const results = await dbService.getTestResults(testId);
 
-        let exportData;
-        
-        if (testIds.length > 0) {
-            // Export specific tests
-            exportData = await exportSpecificTests(testIds, includeConfig);
-        } else {
-            // Export by date range
-            exportData = await exportByDateRange(startDate, endDate, includeConfig);
+        const exportData = {
+            testId,
+            exportedAt: new Date().toISOString(),
+            ...(includeConfig && { config: testConfig }),
+            results
+        };
+
+        const exportDir = path.join(__dirname, '../data/exports');
+        await fs.mkdir(exportDir, { recursive: true });
+
+        let filename, content, mimeType;
+
+        switch (format.toLowerCase()) {
+            case 'json':
+                filename = `test-${testId}-${Date.now()}.json`;
+                content = JSON.stringify(exportData, null, 2);
+                mimeType = 'application/json';
+                break;
+
+            case 'csv':
+                filename = `test-${testId}-${Date.now()}.csv`;
+                content = await convertToCSV(results);
+                mimeType = 'text/csv';
+                break;
+
+            case 'xml':
+                filename = `test-${testId}-${Date.now()}.xml`;
+                content = await convertToXML(exportData);
+                mimeType = 'application/xml';
+                break;
+
+            case 'html':
+                filename = `test-${testId}-${Date.now()}.html`;
+                content = await convertToHTML(exportData);
+                mimeType = 'text/html';
+                break;
+
+            default:
+                return res.status(400).json({
+                    error: 'Unsupported format',
+                    supportedFormats: ['json', 'csv', 'xml', 'html']
+                });
         }
 
-        const exportResult = await generateExport(exportData, format);
-        
+        const filepath = path.join(exportDir, filename);
+        await fs.writeFile(filepath, content);
+
+        logger.info(`Test results exported: ${filepath}`);
+
         res.json({
             success: true,
+            filename,
+            filepath: `/api/results/download/${filename}`,
             format,
-            filename: exportResult.filename,
-            size: exportResult.size,
-            recordCount: exportData.length,
-            downloadUrl: `/api/results/download/${exportResult.filename}`
+            size: content.length
         });
 
     } catch (error) {
@@ -120,26 +209,43 @@ router.post('/export', async (req, res) => {
     }
 });
 
-// Download Exported File
-router.get('/download/:filename', (req, res) => {
+// Download exported file
+router.get('/download/:filename', async (req, res) => {
     try {
         const { filename } = req.params;
-        const filePath = path.join(__dirname, '../data/exports', filename);
+        const filepath = path.join(__dirname, '../data/exports', filename);
 
-        if (!fs.existsSync(filePath)) {
+        // Security check - ensure filename doesn't contain path traversal
+        if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+            return res.status(400).json({
+                error: 'Invalid filename'
+            });
+        }
+
+        try {
+            await fs.access(filepath);
+        } catch (accessError) {
             return res.status(404).json({
                 error: 'File not found'
             });
         }
 
-        res.download(filePath, filename, (err) => {
-            if (err) {
-                logger.error('File download error:', err);
-                res.status(500).json({
-                    error: 'Failed to download file'
-                });
-            }
-        });
+        const stats = await fs.stat(filepath);
+        const ext = path.extname(filename).toLowerCase();
+        
+        const mimeTypes = {
+            '.json': 'application/json',
+            '.csv': 'text/csv',
+            '.xml': 'application/xml',
+            '.html': 'text/html'
+        };
+
+        res.setHeader('Content-Type', mimeTypes[ext] || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('Content-Length', stats.size);
+
+        const fileStream = require('fs').createReadStream(filepath);
+        fileStream.pipe(res);
 
     } catch (error) {
         logger.error('Download file error:', error);
@@ -150,498 +256,294 @@ router.get('/download/:filename', (req, res) => {
     }
 });
 
-// Get Historical Analytics
-router.get('/analytics', async (req, res) => {
+// Get test statistics
+router.get('/stats/summary', async (req, res) => {
     try {
-        const { 
-            period = '7d',
-            testType,
-            metric = 'all'
-        } = req.query;
+        const stats = await dbService.getTestStatistics();
+        
+        // Additional statistics
+        const recentTests = await dbService.getRecentTests(10);
+        
+        // Get test type distribution
+        const typeDistribution = await dbService.db.all(`
+            SELECT type, COUNT(*) as count 
+            FROM test_configs 
+            GROUP BY type 
+            ORDER BY count DESC
+        `);
 
-        const analytics = await generateAnalytics(period, testType, metric);
+        // Get status distribution
+        const statusDistribution = await dbService.db.all(`
+            SELECT status, COUNT(*) as count 
+            FROM test_configs 
+            GROUP BY status
+        `);
+
+        // Get hourly test activity for last 24 hours
+        const hourlyActivity = await dbService.db.all(`
+            SELECT 
+                strftime('%H', created_at) as hour,
+                COUNT(*) as count
+            FROM test_configs 
+            WHERE created_at >= datetime('now', '-24 hours')
+            GROUP BY strftime('%H', created_at)
+            ORDER BY hour
+        `);
 
         res.json({
-            period,
-            testType: testType || 'all',
-            metric,
-            analytics,
+            ...stats,
+            recentTests,
+            typeDistribution,
+            statusDistribution,
+            hourlyActivity,
             generatedAt: new Date().toISOString()
         });
 
     } catch (error) {
-        logger.error('Get analytics error:', error);
+        logger.error('Get test statistics error:', error);
         res.status(500).json({
-            error: 'Failed to get analytics',
+            error: 'Failed to get test statistics',
             message: error.message
         });
     }
 });
 
-// Get Coverage Heatmap Data
-router.get('/coverage-heatmap', async (req, res) => {
+// Delete test results
+router.delete('/:testId', async (req, res) => {
     try {
-        const { 
-            bounds,
-            carrierId,
-            startDate,
-            endDate
-        } = req.query;
+        const { testId } = req.params;
 
-        if (!bounds) {
-            return res.status(400).json({
-                error: 'Geographic bounds are required'
+        const testConfig = await dbService.getTestStatus(testId);
+        if (!testConfig) {
+            return res.status(404).json({
+                error: 'Test not found'
             });
         }
 
-        const boundsArray = bounds.split(',').map(Number);
-        if (boundsArray.length !== 4) {
-            return res.status(400).json({
-                error: 'Bounds should be in format: south,west,north,east'
-            });
+        // Stop test if it's running
+        if (testConfig.status === 'running') {
+            const TestingEngine = require('../services/testing-engine');
+            const testingEngine = new TestingEngine();
+            await testingEngine.stopTest(testId);
         }
 
-        const [south, west, north, east] = boundsArray;
-        const boundsObj = { south, west, north, east };
+        // Delete test results
+        await dbService.db.run('DELETE FROM test_results WHERE test_id = ?', [testId]);
+        await dbService.db.run('DELETE FROM api_test_results WHERE test_id = ?', [testId]);
+        await dbService.db.run('DELETE FROM test_configs WHERE id = ?', [testId]);
 
-        const coverageData = await dbService.getCoverageData(boundsObj, carrierId);
-
-        // Process data for heatmap
-        const heatmapData = coverageData.map(point => ({
-            lat: point.latitude,
-            lng: point.longitude,
-            intensity: normalizeSignalStrength(point.signal_strength),
-            networkType: point.network_type,
-            timestamp: point.timestamp
-        }));
-
-        res.json({
-            bounds: boundsObj,
-            carrierId: carrierId || 'all',
-            dataPoints: heatmapData.length,
-            heatmapData
-        });
-
-    } catch (error) {
-        logger.error('Get coverage heatmap error:', error);
-        res.status(500).json({
-            error: 'Failed to get coverage heatmap data',
-            message: error.message
-        });
-    }
-});
-
-// Generate Performance Report
-router.post('/performance-report', async (req, res) => {
-    try {
-        const {
-            testIds = [],
-            includeCharts = true,
-            includeRawData = false,
-            format = 'html'
-        } = req.body;
-
-        if (testIds.length === 0) {
-            return res.status(400).json({
-                error: 'At least one test ID is required'
-            });
-        }
-
-        logger.info('Generating performance report', { 
-            testIds: testIds.length, 
-            format 
-        });
-
-        const reportData = await generatePerformanceReport(
-            testIds, 
-            includeCharts, 
-            includeRawData
-        );
-
-        const report = await formatReport(reportData, format);
+        logger.info(`Test ${testId} deleted`);
 
         res.json({
             success: true,
-            format,
-            filename: report.filename,
-            size: report.size,
-            downloadUrl: `/api/results/download/${report.filename}`,
-            summary: reportData.summary
+            testId,
+            message: 'Test results deleted successfully'
         });
 
     } catch (error) {
-        logger.error('Generate performance report error:', error);
+        logger.error('Delete test results error:', error);
         res.status(500).json({
-            error: 'Failed to generate performance report',
+            error: 'Failed to delete test results',
             message: error.message
         });
     }
 });
 
-// Implementation functions
-async function exportSpecificTests(testIds, includeConfig) {
-    const exportData = [];
-    
-    for (const testId of testIds) {
-        const testConfig = includeConfig ? await dbService.getTestStatus(testId) : null;
-        const testResults = await dbService.getTestResults(testId);
-        
-        exportData.push({
-            testId,
-            config: testConfig,
-            results: testResults,
-            exportedAt: new Date().toISOString()
-        });
-    }
-    
-    return exportData;
-}
+// Bulk delete tests
+router.post('/bulk-delete', async (req, res) => {
+    try {
+        const { testIds, olderThan } = req.body;
 
-async function exportByDateRange(startDate, endDate, includeConfig) {
-    // Implementation would query database by date range
-    // For now, return sample data
-    return [];
-}
+        let deletedCount = 0;
 
-async function generateExport(data, format) {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const filename = `test-results-${timestamp}.${format}`;
-    const exportPath = path.join(__dirname, '../data/exports', filename);
-
-    // Ensure exports directory exists
-    const exportsDir = path.dirname(exportPath);
-    if (!fs.existsSync(exportsDir)) {
-        fs.mkdirSync(exportsDir, { recursive: true });
-    }
-
-    let content;
-
-    switch (format) {
-        case 'json':
-            content = JSON.stringify(data, null, 2);
-            break;
-        case 'csv':
-            content = convertToCSV(data);
-            break;
-        case 'xml':
-            content = convertToXML(data);
-            break;
-        case 'html':
-            content = convertToHTML(data);
-            break;
-        default:
-            throw new Error(`Unsupported format: ${format}`);
-    }
-
-    fs.writeFileSync(exportPath, content);
-
-    return {
-        filename,
-        size: fs.statSync(exportPath).size
-    };
-}
-
-function convertToCSV(data) {
-    if (!data.length) return '';
-    
-    const headers = Object.keys(data[0]);
-    const csvContent = [
-        headers.join(','),
-        ...data.map(row => 
-            headers.map(header => 
-                JSON.stringify(row[header] || '')
-            ).join(',')
-        )
-    ].join('\n');
-    
-    return csvContent;
-}
-
-function convertToXML(data) {
-    let xml = '<?xml version="1.0" encoding="UTF-8"?>\n<testResults>\n';
-    
-    data.forEach(item => {
-        xml += '  <test>\n';
-        Object.entries(item).forEach(([key, value]) => {
-            xml += `    <${key}>${escapeXML(JSON.stringify(value))}</${key}>\n`;
-        });
-        xml += '  </test>\n';
-    });
-    
-    xml += '</testResults>';
-    return xml;
-}
-
-function convertToHTML(data) {
-    let html = `
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Test Results Export</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 20px; }
-            table { border-collapse: collapse; width: 100%; }
-            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-            th { background-color: #f2f2f2; }
-            .summary { background-color: #e7f3ff; padding: 15px; margin-bottom: 20px; }
-        </style>
-    </head>
-    <body>
-        <h1>Test Results Export</h1>
-        <div class="summary">
-            <h2>Summary</h2>
-            <p>Total Records: ${data.length}</p>
-            <p>Generated: ${new Date().toISOString()}</p>
-        </div>
-        <table>
-            <thead>
-                <tr>
-                    <th>Test ID</th>
-                    <th>Type</th>
-                    <th>Status</th>
-                    <th>Results Count</th>
-                    <th>Created</th>
-                </tr>
-            </thead>
-            <tbody>
-    `;
-    
-    data.forEach(item => {
-        html += `
-                <tr>
-                    <td>${item.testId}</td>
-                    <td>${item.config?.type || 'N/A'}</td>
-                    <td>${item.config?.status || 'N/A'}</td>
-                    <td>${item.results?.length || 0}</td>
-                    <td>${item.config?.created_at || 'N/A'}</td>
-                </tr>
-        `;
-    });
-    
-    html += `
-            </tbody>
-        </table>
-    </body>
-    </html>
-    `;
-    
-    return html;
-}
-
-function escapeXML(text) {
-    return text
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&apos;');
-}
-
-async function generateAnalytics(period, testType, metric) {
-    // Mock analytics data - replace with actual database queries
-    const now = new Date();
-    const analytics = {
-        summary: {
-            totalTests: Math.floor(Math.random() * 1000 + 100),
-            successRate: Math.floor(Math.random() * 20 + 80),
-            averageResponseTime: Math.floor(Math.random() * 100 + 50),
-            errorRate: Math.floor(Math.random() * 5 + 1)
-        },
-        trends: {
-            daily: generateTrendData(7),
-            hourly: generateTrendData(24)
-        },
-        testTypes: {
-            network: Math.floor(Math.random() * 100 + 20),
-            localization: Math.floor(Math.random() * 50 + 10),
-            api: Math.floor(Math.random() * 75 + 15)
-        }
-    };
-    
-    return analytics;
-}
-
-function generateTrendData(points) {
-    return Array.from({ length: points }, (_, i) => ({
-        timestamp: new Date(Date.now() - (points - i) * 24 * 60 * 60 * 1000).toISOString(),
-        value: Math.floor(Math.random() * 100 + 20)
-    }));
-}
-
-function normalizeSignalStrength(signalStrength) {
-    // Convert signal strength (-120 to -30 dBm) to intensity (0 to 1)
-    const min = -120;
-    const max = -30;
-    return Math.max(0, Math.min(1, (signalStrength - min) / (max - min)));
-}
-
-async function generatePerformanceReport(testIds, includeCharts, includeRawData) {
-    const reportData = {
-        summary: {
-            testCount: testIds.length,
-            generatedAt: new Date().toISOString(),
-            totalDuration: 0,
-            averageSuccessRate: 0
-        },
-        tests: [],
-        charts: includeCharts ? [] : null,
-        rawData: includeRawData ? [] : null
-    };
-    
-    // Process each test
-    for (const testId of testIds) {
-        const testConfig = await dbService.getTestStatus(testId);
-        const testResults = await dbService.getTestResults(testId, 1000);
-        
-        if (testConfig && testResults.length > 0) {
-            const testSummary = {
-                testId,
-                type: testConfig.type,
-                status: testConfig.status,
-                startTime: testConfig.created_at,
-                endTime: testConfig.updated_at,
-                resultCount: testResults.length,
-                metrics: calculateTestMetrics(testResults)
-            };
-            
-            reportData.tests.push(testSummary);
-            
-            if (includeRawData) {
-                reportData.rawData.push({
-                    testId,
-                    results: testResults
-                });
+        if (testIds && Array.isArray(testIds)) {
+            // Delete specific tests
+            for (const testId of testIds) {
+                await dbService.db.run('DELETE FROM test_results WHERE test_id = ?', [testId]);
+                await dbService.db.run('DELETE FROM api_test_results WHERE test_id = ?', [testId]);
+                await dbService.db.run('DELETE FROM test_configs WHERE id = ?', [testId]);
+                deletedCount++;
             }
         }
+
+        if (olderThan) {
+            // Delete tests older than specified date
+            const cutoffDate = new Date(olderThan).toISOString();
+            
+            const oldTests = await dbService.db.all(
+                'SELECT id FROM test_configs WHERE created_at < ?',
+                [cutoffDate]
+            );
+
+            for (const test of oldTests) {
+                await dbService.db.run('DELETE FROM test_results WHERE test_id = ?', [test.id]);
+                await dbService.db.run('DELETE FROM api_test_results WHERE test_id = ?', [test.id]);
+                await dbService.db.run('DELETE FROM test_configs WHERE id = ?', [test.id]);
+                deletedCount++;
+            }
+        }
+
+        logger.info(`Bulk deleted ${deletedCount} tests`);
+
+        res.json({
+            success: true,
+            deletedCount,
+            message: `Successfully deleted ${deletedCount} test(s)`
+        });
+
+    } catch (error) {
+        logger.error('Bulk delete error:', error);
+        res.status(500).json({
+            error: 'Failed to bulk delete tests',
+            message: error.message
+        });
     }
-    
-    // Calculate overall summary
-    reportData.summary.averageSuccessRate = reportData.tests.length > 0
-        ? reportData.tests.reduce((acc, test) => acc + (test.metrics.successRate || 0), 0) / reportData.tests.length
-        : 0;
-    
-    return reportData;
+});
+
+// Helper functions for export formats
+
+async function convertToCSV(results) {
+    if (results.length === 0) return 'No data available';
+
+    // Get all unique keys from all results
+    const allKeys = new Set();
+    results.forEach(result => {
+        const data = result.result_data || result;
+        Object.keys(data).forEach(key => allKeys.add(key));
+    });
+
+    const headers = Array.from(allKeys).join(',');
+    const rows = results.map(result => {
+        const data = result.result_data || result;
+        return Array.from(allKeys).map(key => {
+            const value = data[key];
+            if (value === null || value === undefined) return '';
+            if (typeof value === 'object') return JSON.stringify(value);
+            return String(value).replace(/"/g, '""');
+        }).map(v => `"${v}"`).join(',');
+    });
+
+    return [headers, ...rows].join('\n');
 }
 
-function calculateTestMetrics(results) {
-    if (!results.length) return {};
-    
-    const successfulResults = results.filter(r => 
-        r.result_data && 
-        (JSON.parse(r.result_data).success !== false)
-    );
-    
-    return {
-        totalResults: results.length,
-        successfulResults: successfulResults.length,
-        successRate: (successfulResults.length / results.length) * 100,
-        firstResult: results[results.length - 1].timestamp,
-        lastResult: results[0].timestamp
-    };
-}
-
-async function formatReport(reportData, format) {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const filename = `performance-report-${timestamp}.${format}`;
-    const reportPath = path.join(__dirname, '../data/exports', filename);
-
-    let content;
-
-    switch (format) {
-        case 'json':
-            content = JSON.stringify(reportData, null, 2);
-            break;
-        case 'html':
-            content = generateHTMLReport(reportData);
-            break;
-        case 'pdf':
-            // For PDF generation, you would use a library like puppeteer or pdfkit
-            content = generateHTMLReport(reportData); // Fallback to HTML
-            break;
-        default:
-            throw new Error(`Unsupported report format: ${format}`);
+async function convertToXML(data) {
+    function objectToXML(obj, rootName = 'root') {
+        let xml = `<${rootName}>`;
+        
+        for (const [key, value] of Object.entries(obj)) {
+            if (Array.isArray(value)) {
+                xml += `<${key}>`;
+                value.forEach((item, index) => {
+                    if (typeof item === 'object') {
+                        xml += objectToXML(item, `item_${index}`);
+                    } else {
+                        xml += `<item_${index}>${escapeXML(String(item))}</item_${index}>`;
+                    }
+                });
+                xml += `</${key}>`;
+            } else if (typeof value === 'object' && value !== null) {
+                xml += objectToXML(value, key);
+            } else {
+                xml += `<${key}>${escapeXML(String(value || ''))}</${key}>`;
+            }
+        }
+        
+        xml += `</${rootName}>`;
+        return xml;
     }
 
-    fs.writeFileSync(reportPath, content);
+    function escapeXML(str) {
+        return str.replace(/[<>&'"]/g, function(c) {
+            switch (c) {
+                case '<': return '&lt;';
+                case '>': return '&gt;';
+                case '&': return '&amp;';
+                case "'": return '&apos;';
+                case '"': return '&quot;';
+            }
+        });
+    }
 
-    return {
-        filename,
-        size: fs.statSync(reportPath).size
-    };
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + objectToXML(data, 'testResults');
 }
 
-function generateHTMLReport(reportData) {
-    return `
+async function convertToHTML(data) {
+    const html = `
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
-        <title>Performance Report</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Test Results - ${data.testId}</title>
         <style>
-            body { font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }
-            .header { background: linear-gradient(45deg, #00d4ff, #7c3aed); color: white; padding: 20px; border-radius: 10px; }
-            .summary { background: #f8f9fa; padding: 20px; margin: 20px 0; border-radius: 8px; }
-            .metric { display: inline-block; margin: 10px 20px 10px 0; }
-            .metric-value { font-size: 2em; font-weight: bold; color: #00d4ff; }
-            .metric-label { font-size: 0.9em; color: #666; }
-            table { border-collapse: collapse; width: 100%; margin: 20px 0; }
-            th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-            th { background-color: #f2f2f2; font-weight: bold; }
-            .status-success { color: #22c55e; font-weight: bold; }
-            .status-failed { color: #ef4444; font-weight: bold; }
-            .status-running { color: #f59e0b; font-weight: bold; }
+            body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+            .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1, h2, h3 { color: #333; }
+            table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+            th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+            th { background-color: #f8f9fa; font-weight: 600; }
+            .status-running { color: #007bff; }
+            .status-completed { color: #28a745; }
+            .status-failed { color: #dc3545; }
+            .json-data { background: #f8f9fa; padding: 15px; border-radius: 4px; font-family: monospace; white-space: pre-wrap; font-size: 12px; }
+            .header-info { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+            .info-card { background: #f8f9fa; padding: 15px; border-radius: 8px; }
         </style>
     </head>
     <body>
-        <div class="header">
-            <h1>Mobile Carrier Testing Framework</h1>
-            <h2>Performance Report</h2>
-            <p>Generated: ${reportData.summary.generatedAt}</p>
-        </div>
-        
-        <div class="summary">
-            <h2>Summary</h2>
-            <div class="metric">
-                <div class="metric-value">${reportData.summary.testCount}</div>
-                <div class="metric-label">Total Tests</div>
+        <div class="container">
+            <h1>Test Results Report</h1>
+            
+            <div class="header-info">
+                <div class="info-card">
+                    <h3>Test ID</h3>
+                    <p>${data.testId}</p>
+                </div>
+                <div class="info-card">
+                    <h3>Export Date</h3>
+                    <p>${new Date(data.exportedAt).toLocaleString()}</p>
+                </div>
+                <div class="info-card">
+                    <h3>Results Count</h3>
+                    <p>${data.results.length}</p>
+                </div>
+                ${data.config ? `
+                <div class="info-card">
+                    <h3>Test Status</h3>
+                    <p class="status-${data.config.status}">${data.config.status.toUpperCase()}</p>
+                </div>
+                ` : ''}
             </div>
-            <div class="metric">
-                <div class="metric-value">${reportData.summary.averageSuccessRate.toFixed(1)}%</div>
-                <div class="metric-label">Average Success Rate</div>
-            </div>
-        </div>
-        
-        <h2>Test Details</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>Test ID</th>
-                    <th>Type</th>
-                    <th>Status</th>
-                    <th>Results</th>
-                    <th>Success Rate</th>
-                    <th>Start Time</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${reportData.tests.map(test => `
+
+            ${data.config ? `
+            <h2>Test Configuration</h2>
+            <div class="json-data">${JSON.stringify(JSON.parse(data.config.config), null, 2)}</div>
+            ` : ''}
+
+            <h2>Test Results</h2>
+            ${data.results.length > 0 ? `
+            <table>
+                <thead>
                     <tr>
-                        <td>${test.testId}</td>
-                        <td>${test.type}</td>
-                        <td class="status-${test.status}">${test.status}</td>
-                        <td>${test.resultCount}</td>
-                        <td>${test.metrics.successRate?.toFixed(1) || 'N/A'}%</td>
-                        <td>${new Date(test.startTime).toLocaleString()}</td>
+                        <th>Timestamp</th>
+                        <th>Result Data</th>
                     </tr>
-                `).join('')}
-            </tbody>
-        </table>
-        
-        <div style="margin-top: 40px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; font-size: 0.9em;">
-            <p>Report generated by Mobile Carrier Testing Framework</p>
+                </thead>
+                <tbody>
+                    ${data.results.map(result => `
+                    <tr>
+                        <td>${new Date(result.timestamp).toLocaleString()}</td>
+                        <td><div class="json-data">${JSON.stringify(result.result_data, null, 2)}</div></td>
+                    </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+            ` : '<p>No results available.</p>'}
         </div>
     </body>
-    </html>
-    `;
+    </html>`;
+
+    return html;
 }
 
 module.exports = router;

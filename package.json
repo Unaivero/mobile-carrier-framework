@@ -40,8 +40,11 @@
     "bcrypt": "^5.1.0",
     "jsonwebtoken": "^9.0.1",
     "dotenv": "^16.1.4",
-    "speed-test": "^2.1.0",
+    "fast-speedtest-api": "^0.3.2",
+    "network-speed": "^2.1.1",
     "ping": "^0.4.4",
+    "node-wifi": "^2.0.15",
+    "systeminformation": "^5.21.7",
     "geolib": "^3.3.4",
     "chart.js": "^4.3.0"
   },

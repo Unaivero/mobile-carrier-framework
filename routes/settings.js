@@ -8,16 +8,11 @@ const Logger = require('../services/logger');
 const logger = new Logger();
 const dbService = new DatabaseService();
 
-// Get All Settings
+// Get all settings
 router.get('/', async (req, res) => {
     try {
         const settings = await dbService.getAllSettings();
-        
-        res.json({
-            settings,
-            timestamp: new Date().toISOString()
-        });
-
+        res.json(settings);
     } catch (error) {
         logger.error('Get settings error:', error);
         res.status(500).json({
@@ -27,8 +22,54 @@ router.get('/', async (req, res) => {
     }
 });
 
-// Update Settings
-router.put('/', async (req, res) => {
+// Get specific setting
+router.get('/:key', async (req, res) => {
+    try {
+        const { key } = req.params;
+        const value = await dbService.getSetting(key);
+        
+        if (value === null) {
+            return res.status(404).json({
+                error: 'Setting not found'
+            });
+        }
+
+        res.json({ key, value });
+    } catch (error) {
+        logger.error('Get setting error:', error);
+        res.status(500).json({
+            error: 'Failed to get setting',
+            message: error.message
+        });
+    }
+});
+
+// Update setting
+router.put('/:key', async (req, res) => {
+    try {
+        const { key } = req.params;
+        const { value } = req.body;
+
+        await dbService.saveSetting(key, value);
+        logger.info(`Setting updated: ${key}`);
+
+        res.json({
+            success: true,
+            key,
+            value,
+            message: 'Setting updated successfully'
+        });
+    } catch (error) {
+        logger.error('Update setting error:', error);
+        res.status(500).json({
+            error: 'Failed to update setting',
+            message: error.message
+        });
+    }
+});
+
+// Update multiple settings
+router.post('/bulk', async (req, res) => {
     try {
         const { settings } = req.body;
 
@@ -38,21 +79,21 @@ router.put('/', async (req, res) => {
             });
         }
 
-        // Save each setting
+        const updatedSettings = {};
         for (const [key, value] of Object.entries(settings)) {
             await dbService.saveSetting(key, value);
+            updatedSettings[key] = value;
         }
 
-        logger.info('Settings updated', { settingsCount: Object.keys(settings).length });
+        logger.info(`Bulk settings update: ${Object.keys(settings).join(', ')}`);
 
         res.json({
             success: true,
-            message: 'Settings updated successfully',
-            updatedSettings: Object.keys(settings)
+            updatedSettings,
+            message: 'Settings updated successfully'
         });
-
     } catch (error) {
-        logger.error('Update settings error:', error);
+        logger.error('Bulk update settings error:', error);
         res.status(500).json({
             error: 'Failed to update settings',
             message: error.message
@@ -60,198 +101,123 @@ router.put('/', async (req, res) => {
     }
 });
 
-// Test Database Connection
-router.post('/test-database', async (req, res) => {
+// Reset settings to default
+router.post('/reset', async (req, res) => {
     try {
-        const { connectionString, dbType } = req.body;
-
-        // For now, simulate database connection test
-        const testResult = {
-            success: Math.random() > 0.2, // 80% success rate
-            responseTime: Math.floor(Math.random() * 1000 + 100),
-            dbType: dbType || 'sqlite'
+        const defaultSettings = {
+            defaultTimeout: 60,
+            retryAttempts: 3,
+            parallelLimit: 5,
+            autoSchedule: 'disabled',
+            notificationEmail: '',
+            webhookUrl: '',
+            dataRetentionDays: 30,
+            logLevel: 'info',
+            enableRealTimeUpdates: true,
+            maxConcurrentTests: 10,
+            apiRateLimit: 100,
+            backupEnabled: false,
+            backupInterval: 'daily'
         };
 
-        if (testResult.success) {
-            logger.info('Database connection test successful', { dbType, responseTime: testResult.responseTime });
-        } else {
-            logger.warn('Database connection test failed', { dbType });
+        for (const [key, value] of Object.entries(defaultSettings)) {
+            await dbService.saveSetting(key, value);
         }
 
-        res.json({
-            success: testResult.success,
-            responseTime: testResult.responseTime,
-            message: testResult.success 
-                ? 'Database connection successful' 
-                : 'Database connection failed'
-        });
-
-    } catch (error) {
-        logger.error('Database connection test error:', error);
-        res.status(500).json({
-            error: 'Failed to test database connection',
-            message: error.message
-        });
-    }
-});
-
-// System Maintenance
-router.post('/maintenance', async (req, res) => {
-    try {
-        const { action, options = {} } = req.body;
-
-        const supportedActions = ['clear-logs', 'clear-cache', 'export-data', 'cleanup-old-data'];
-        
-        if (!supportedActions.includes(action)) {
-            return res.status(400).json({
-                error: 'Unsupported maintenance action',
-                supportedActions
-            });
-        }
-
-        logger.info('Performing maintenance action', { action, options });
-
-        let result;
-
-        switch (action) {
-            case 'clear-logs':
-                result = await clearLogs();
-                break;
-            case 'clear-cache':
-                result = await clearCache();
-                break;
-            case 'export-data':
-                result = await exportSystemData(options);
-                break;
-            case 'cleanup-old-data':
-                result = await cleanupOldData(options.daysToKeep || 30);
-                break;
-        }
+        logger.info('Settings reset to defaults');
 
         res.json({
             success: true,
-            action,
-            result,
-            timestamp: new Date().toISOString()
+            settings: defaultSettings,
+            message: 'Settings reset to defaults'
         });
-
     } catch (error) {
-        logger.error('Maintenance action error:', error);
+        logger.error('Reset settings error:', error);
         res.status(500).json({
-            error: 'Failed to perform maintenance action',
+            error: 'Failed to reset settings',
             message: error.message
         });
     }
 });
 
-// Get System Information
-router.get('/system-info', async (req, res) => {
+// Get system configuration
+router.get('/system/config', async (req, res) => {
     try {
-        const systemInfo = {
-            version: process.env.npm_package_version || '1.0.0',
+        const config = {
             nodeVersion: process.version,
             platform: process.platform,
-            uptime: process.uptime(),
-            memory: process.memoryUsage(),
-            environment: process.env.NODE_ENV || 'development',
-            database: {
-                type: process.env.DB_TYPE || 'sqlite',
-                path: process.env.DB_PATH || './data/database.sqlite'
+            architecture: process.arch,
+            memory: {
+                total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+                used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+                external: Math.round(process.memoryUsage().external / 1024 / 1024)
             },
+            uptime: Math.round(process.uptime()),
+            environment: process.env.NODE_ENV || 'development',
+            databaseConnected: dbService.db ? true : false,
             features: {
-                webSocket: true,
-                apiTesting: true,
                 networkTesting: true,
                 localizationTesting: true,
-                realTimeMonitoring: true,
-                dataExport: true
+                apiTesting: true,
+                realTimeUpdates: true,
+                dataExport: true,
+                scheduling: false
             }
         };
 
-        res.json(systemInfo);
-
+        res.json(config);
     } catch (error) {
-        logger.error('Get system info error:', error);
+        logger.error('Get system config error:', error);
         res.status(500).json({
-            error: 'Failed to get system information',
+            error: 'Failed to get system configuration',
             message: error.message
         });
     }
 });
 
-// Manage Carriers
-router.get('/carriers', async (req, res) => {
-    try {
-        const carriers = await dbService.getCarriers();
-        
-        res.json({
-            carriers,
-            count: carriers.length
-        });
-
-    } catch (error) {
-        logger.error('Get carriers error:', error);
-        res.status(500).json({
-            error: 'Failed to get carriers',
-            message: error.message
-        });
-    }
-});
-
-router.post('/carriers', async (req, res) => {
-    try {
-        const carrier = req.body;
-
-        if (!carrier.id || !carrier.name) {
-            return res.status(400).json({
-                error: 'Carrier ID and name are required'
-            });
-        }
-
-        await dbService.saveCarrier(carrier);
-        
-        logger.info('Carrier saved', { carrierId: carrier.id, name: carrier.name });
-
-        res.json({
-            success: true,
-            message: 'Carrier saved successfully',
-            carrier
-        });
-
-    } catch (error) {
-        logger.error('Save carrier error:', error);
-        res.status(500).json({
-            error: 'Failed to save carrier',
-            message: error.message
-        });
-    }
-});
-
-// Notification Settings
+// Test notification settings
 router.post('/test-notification', async (req, res) => {
     try {
-        const { type, recipient, message } = req.body;
-
-        if (!type || !recipient || !message) {
-            return res.status(400).json({
-                error: 'Type, recipient, and message are required'
-            });
-        }
-
-        const NotificationService = require('../services/notification');
-        const notificationService = new NotificationService();
+        const { type = 'email', recipient } = req.body;
 
         if (type === 'email') {
-            await notificationService.sendEmail(recipient, 'Test Notification', message, 'info');
+            const NotificationService = require('../services/notification');
+            const notificationService = new NotificationService();
+            
+            await notificationService.sendEmail({
+                to: recipient,
+                subject: 'Mobile Carrier Framework - Test Notification',
+                text: 'This is a test notification to verify your email configuration.',
+                html: '<p>This is a test notification to verify your email configuration.</p>'
+            });
+
+            res.json({
+                success: true,
+                message: 'Test email sent successfully'
+            });
         } else if (type === 'webhook') {
-            await notificationService.sendWebhook(message, 'info');
+            const axios = require('axios');
+            const testPayload = {
+                test: true,
+                message: 'This is a test webhook notification',
+                timestamp: new Date().toISOString()
+            };
+
+            await axios.post(recipient, testPayload, {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 10000
+            });
+
+            res.json({
+                success: true,
+                message: 'Test webhook sent successfully'
+            });
+        } else {
+            return res.status(400).json({
+                error: 'Invalid notification type',
+                supportedTypes: ['email', 'webhook']
+            });
         }
-
-        res.json({
-            success: true,
-            message: 'Test notification sent successfully'
-        });
-
     } catch (error) {
         logger.error('Test notification error:', error);
         res.status(500).json({
@@ -261,123 +227,152 @@ router.post('/test-notification', async (req, res) => {
     }
 });
 
-// Get Notifications
-router.get('/notifications', async (req, res) => {
+// Get carriers configuration
+router.get('/carriers', async (req, res) => {
     try {
-        const { unreadOnly = false, limit = 50 } = req.query;
-        
-        const notifications = await dbService.getNotifications(
-            unreadOnly === 'true', 
-            parseInt(limit)
-        );
-
-        res.json({
-            notifications,
-            count: notifications.length,
-            unreadCount: notifications.filter(n => !n.read).length
-        });
-
+        const carriers = await dbService.getCarriers();
+        res.json(carriers);
     } catch (error) {
-        logger.error('Get notifications error:', error);
+        logger.error('Get carriers error:', error);
         res.status(500).json({
-            error: 'Failed to get notifications',
+            error: 'Failed to get carriers',
             message: error.message
         });
     }
 });
 
-// Mark Notification as Read
-router.patch('/notifications/:id/read', async (req, res) => {
+// Add or update carrier
+router.post('/carriers', async (req, res) => {
     try {
-        const { id } = req.params;
-        
-        await dbService.markNotificationRead(parseInt(id));
+        const {
+            id,
+            name,
+            apiEndpoint,
+            authConfig = {},
+            features = []
+        } = req.body;
+
+        if (!id || !name) {
+            return res.status(400).json({
+                error: 'Carrier ID and name are required'
+            });
+        }
+
+        const carrier = {
+            id,
+            name,
+            apiEndpoint,
+            authConfig,
+            features
+        };
+
+        await dbService.saveCarrier(carrier);
+        logger.info(`Carrier saved: ${name}`);
 
         res.json({
             success: true,
-            message: 'Notification marked as read'
+            carrier,
+            message: 'Carrier saved successfully'
         });
-
     } catch (error) {
-        logger.error('Mark notification read error:', error);
+        logger.error('Save carrier error:', error);
         res.status(500).json({
-            error: 'Failed to mark notification as read',
+            error: 'Failed to save carrier',
             message: error.message
         });
     }
 });
 
-// Implementation functions
-async function clearLogs() {
-    const fs = require('fs');
-    const path = require('path');
-    
-    const logsDir = path.join(__dirname, '../data/logs');
-    const logFiles = ['app.log', 'error.log'];
-    
-    let clearedFiles = 0;
-    
-    for (const logFile of logFiles) {
-        const logPath = path.join(logsDir, logFile);
-        if (fs.existsSync(logPath)) {
-            fs.writeFileSync(logPath, '');
-            clearedFiles++;
+// Delete carrier
+router.delete('/carriers/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        await dbService.db.run('DELETE FROM carriers WHERE id = ?', [id]);
+        logger.info(`Carrier deleted: ${id}`);
+
+        res.json({
+            success: true,
+            carrierId: id,
+            message: 'Carrier deleted successfully'
+        });
+    } catch (error) {
+        logger.error('Delete carrier error:', error);
+        res.status(500).json({
+            error: 'Failed to delete carrier',
+            message: error.message
+        });
+    }
+});
+
+// Database maintenance
+router.post('/maintenance/cleanup', async (req, res) => {
+    try {
+        const { daysToKeep = 30 } = req.body;
+        
+        await dbService.clearOldData(daysToKeep);
+        logger.info(`Database cleanup completed: kept ${daysToKeep} days`);
+
+        res.json({
+            success: true,
+            daysToKeep,
+            message: 'Database cleanup completed successfully'
+        });
+    } catch (error) {
+        logger.error('Database cleanup error:', error);
+        res.status(500).json({
+            error: 'Failed to cleanup database',
+            message: error.message
+        });
+    }
+});
+
+// System health check
+router.get('/health', async (req, res) => {
+    try {
+        const health = {
+            status: 'healthy',
+            timestamp: new Date().toISOString(),
+            checks: {
+                database: { status: 'healthy', responseTime: 0 },
+                memory: { status: 'healthy', usage: 0 }
+            }
+        };
+
+        // Database check
+        const dbStart = Date.now();
+        try {
+            await dbService.db.get('SELECT 1');
+            health.checks.database.responseTime = Date.now() - dbStart;
+        } catch (dbError) {
+            health.checks.database.status = 'unhealthy';
+            health.checks.database.error = dbError.message;
+            health.status = 'degraded';
         }
+
+        // Memory check
+        const memUsage = process.memoryUsage();
+        const memoryUsagePercent = (memUsage.heapUsed / memUsage.heapTotal) * 100;
+        health.checks.memory.usage = Math.round(memoryUsagePercent);
+        
+        if (memoryUsagePercent > 90) {
+            health.checks.memory.status = 'critical';
+            health.status = 'degraded';
+        } else if (memoryUsagePercent > 80) {
+            health.checks.memory.status = 'warning';
+        }
+
+        const statusCode = health.status === 'healthy' ? 200 : 503;
+        res.status(statusCode).json(health);
+        
+    } catch (error) {
+        logger.error('Health check error:', error);
+        res.status(503).json({
+            status: 'unhealthy',
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
     }
-    
-    return {
-        message: `Cleared ${clearedFiles} log files`,
-        clearedFiles
-    };
-}
-
-async function clearCache() {
-    // Simulate cache clearing
-    return {
-        message: 'Cache cleared successfully',
-        freedSpace: Math.floor(Math.random() * 100 + 10) + 'MB'
-    };
-}
-
-async function exportSystemData(options) {
-    const fs = require('fs');
-    const path = require('path');
-    
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const filename = `system-backup-${timestamp}.json`;
-    const exportPath = path.join(__dirname, '../data/exports', filename);
-    
-    // Ensure exports directory exists
-    const exportsDir = path.dirname(exportPath);
-    if (!fs.existsSync(exportsDir)) {
-        fs.mkdirSync(exportsDir, { recursive: true });
-    }
-    
-    // Get system data
-    const systemData = {
-        settings: await dbService.getAllSettings(),
-        carriers: await dbService.getCarriers(),
-        statistics: await dbService.getTestStatistics(),
-        exportedAt: new Date().toISOString(),
-        version: process.env.npm_package_version || '1.0.0'
-    };
-    
-    fs.writeFileSync(exportPath, JSON.stringify(systemData, null, 2));
-    
-    return {
-        message: 'System data exported successfully',
-        filename,
-        size: fs.statSync(exportPath).size
-    };
-}
-
-async function cleanupOldData(daysToKeep) {
-    const result = await dbService.clearOldData(daysToKeep);
-    
-    return {
-        message: `Cleaned up data older than ${daysToKeep} days`,
-        daysToKeep
-    };
-}
+});
 
 module.exports = router;
