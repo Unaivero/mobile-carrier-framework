@@ -1,3 +1,8 @@
+class DatabaseService {
+    constructor(db) {
+        this.db = db;
+    }
+
     async createNotification(notification) {
         const sql = `INSERT INTO notifications (type, title, message, severity) 
                      VALUES (?, ?, ?, ?)`;
